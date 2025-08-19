@@ -1,72 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-bot.py — Telegram Codegen Bot (ЕДИНЫЙ ФАЙЛ, ГОТОВ ДЛЯ RAILWAY)
+bot.py — Telegram Codegen Bot с командой /create (ЕДИНЫЙ ФАЙЛ, ГОТОВ ДЛЯ RAILWAY)
 
-❖ Назначение
-   Телеграм-бот, который принимает ТЕКСТ или .TXT файл с промптом,
-   отправляет запрос в OpenAI Responses API и возвращает ПОЛНЫЙ готовый файл
-   с кодом. Поддерживает итеративные правки: при следующем промпте бот
-   "читает" предыдущую (latest) версию файла и добавляет её в промпт с чёткими
-   маркерами, чтобы модель изменила ИМЕННО этот код. Сохраняет версии, шлёт diff.
-
-───────────────────────────────────────────────────────────────────────────────
-УСТАНОВКА ЗАВИСИМОСТЕЙ (локально)
-    pip install python-telegram-bot==20.7 openai>=1.40.0 python-dotenv>=1.0.1
-
-МИНИМАЛЬНОЕ .env (Railway → Variables)
-    TELEGRAM_TOKEN=xxx:yyyyyyyyyyyyyyyyyyyyyyyyyyyy
-    OPENAI_API_KEY=sk-................................
-    DEFAULT_MODEL=gpt-5                 # (опционально)
-    OUTPUT_DIR=/data/out               # (опционально, по умолчанию /data/out)
-    OPENAI_REQUEST_TIMEOUT=300         # (опционально, таймаут клиента OpenAI, сек)
-
-СТАРТ (локально)
-    TELEGRAM_TOKEN=... OPENAI_API_KEY=... python3 bot.py
-
-ДЕПЛОЙ НА RAILWAY
-    • Репозиторий должен содержать этот bot.py и (по желанию) start.sh с:
-        #!/usr/bin/env bash
-        set -euo pipefail
-        python3 bot.py
-      (в Railway → Start Command можно указать просто: python3 bot.py)
-    • Добавьте переменные в Variables: TELEGRAM_TOKEN, OPENAI_API_KEY (+ доп. при желании).
-───────────────────────────────────────────────────────────────────────────────
-КАК ПОЛЬЗОВАТЬСЯ
-    1) Отправьте боту ТЕКСТ или .TXT с промптом.
-       ─ Первая строка может задать имя файла:
-            filename: my_app.py
-       ─ Вторая/третья строка — подсказка языка:
-            language: python
-       ─ Можно внизу промпта вложить базовый код в блоке из трёх обратных кавычек:
-            ```
-            ... код ...
-            ```
-          Тогда правки будут применены ИМЕННО к этому коду (приоритет над latest).
-
-    2) Бот сгенерирует/обновит файл, сохранит в:
-            /data/out/<chat_id>/<timestamp>-<filename>
-       и перезапишет latest-<filename>. Пришлёт файл и diff (если было с чем сравнить).
-
-ЛОГИКА ОДНИМ БЛОКОМ
-    ✓ Получаем промпт (или читаем .txt).
-    ✓ Определяем имя файла и язык (из первых строк).
-    ✓ Выбираем базовый код: приоритет — вложенный в промпт блок ```...```,
-      иначе latest-<filename> из папки чата (если есть).
-    ✓ Собираем "композитный" промпт:
-          <ваш текст>
-          Применить изменения к коду ниже.
-          <<BEGIN_BASE_CODE filename=... version=latest>>
-          ```<language>
-          ...код...
-          ```
-          <<END_BASE_CODE>>
-    ✓ Вызываем OpenAI Responses API.
-    ✓ Сохраняем новую версию и latest, отправляем файл и diff.
-
-ВНИМАНИЕ
-    • Модель должна вернуть ТОЛЬКО ПОЛНЫЙ файл внутри fenced-блока ```...```.
-    • Таймаут клиента OpenAI задаётся переменной OPENAI_REQUEST_TIMEOUT (по умолчанию 300 cек).
+Добавлена функциональность:
+• /create <filename> - создание нового файла с указанным именем
+• Автоматическое использование последнего созданного кода при редактировании
+• Сохранение состояния активного файла для каждого чата
 """
 
 from __future__ import annotations
@@ -111,6 +51,8 @@ if not OPENAI_API_KEY:
 
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Доступные модели для валидации
+AVAILABLE_MODELS = ["gpt-4", "gpt-4-turbo", "gpt-5", "claude-3-sonnet", "claude-3-opus"]
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║                   2) НАСТРОЙКИ OPENAI (Responses API)                   ║
@@ -182,6 +124,32 @@ def pick_filename_and_lang(prompt: str) -> Tuple[str, str]:
         language = "javascript"
 
     return filename, language
+
+def detect_language_from_filename(filename: str) -> str:
+    """Определяет язык программирования по расширению файла"""
+    ext = Path(filename).suffix.lower()
+    lang_map = {
+        '.py': 'python',
+        '.js': 'javascript',
+        '.ts': 'typescript',
+        '.java': 'java',
+        '.cpp': 'cpp',
+        '.c': 'c',
+        '.cs': 'csharp',
+        '.php': 'php',
+        '.rb': 'ruby',
+        '.go': 'go',
+        '.rs': 'rust',
+        '.html': 'html',
+        '.css': 'css',
+        '.sql': 'sql',
+        '.sh': 'bash',
+        '.yml': 'yaml',
+        '.yaml': 'yaml',
+        '.json': 'json',
+        '.xml': 'xml'
+    }
+    return lang_map.get(ext, 'text')
 
 def chat_dir(chat_id: int) -> Path:
     """Папка текущего чата: /data/out/<chat_id>"""
@@ -265,11 +233,11 @@ async def call_llm(full_prompt: str, model: str) -> str:
         raise RuntimeError("Модель вернула пустой ответ.")
     return code
 
-async def process_any_prompt(chat_id: int, raw_prompt: str, model: str) -> tuple[Path, Optional[str]]:
+async def process_any_prompt(chat_id: int, raw_prompt: str, model: str, target_filename: str = None) -> tuple[Path, Optional[str]]:
     """
     ЕДИНАЯ функция обработки:
     • Распарсить промпт и вытащить вложенный код (если есть).
-    • Определить имя файла/язык.
+    • Определить имя файла/язык (или использовать target_filename).
     • Выбрать базовый код (приоритет — вложенный; иначе latest-).
     • Сформировать композитный промпт и вызвать модель.
     • Сохранить новую версию и latest.
@@ -279,7 +247,13 @@ async def process_any_prompt(chat_id: int, raw_prompt: str, model: str) -> tuple
     if not prompt:
         raise RuntimeError("Промпт пуст.")
 
-    filename, language = pick_filename_and_lang(prompt)
+    # Используем target_filename если указан, иначе определяем из промпта
+    if target_filename:
+        filename = target_filename
+        language = detect_language_from_filename(filename)
+    else:
+        filename, language = pick_filename_and_lang(prompt)
+    
     ext_hint = f".{Path(filename).suffix.lstrip('.') or 'txt'}"
 
     # Источник правок: вложенный код → latest
@@ -312,62 +286,182 @@ async def process_any_prompt(chat_id: int, raw_prompt: str, model: str) -> tuple
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    help_text = """🤖 **Codegen Bot** - генератор кода
+
+📝 **Основные способы работы:**
+
+1️⃣ **Быстрая генерация:**
+   Отправьте текст с описанием → получите файл
+
+2️⃣ **Создание именованного файла:**
+   `/create app.py` → затем отправьте промпт
+
+3️⃣ **Редактирование:**
+   Отправьте новый промпт → код обновится
+
+⚙️ **Настройки в промпте:**
+• `filename: app.py` - имя файла
+• `language: python` - язык программирования
+
+🔧 **Команды:**
+• `/create <filename>` - создать файл с именем
+• `/model` - выбор ИИ модели  
+• `/files` - список ваших файлов
+• `/reset` - сброс настроек
+
+💡 **Совет:** Можете приложить базовый код в блоке \\```код\\```"""
+    
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def cmd_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда для создания нового файла с указанным именем"""
+    if not ctx.args:
+        await update.message.reply_text(
+            "📁 **Создание файла**\n\n"
+            "Использование: `/create <имя_файла>`\n\n"
+            "Примеры:\n"
+            "• `/create app.py`\n"
+            "• `/create script.js`\n"
+            "• `/create index.html`\n\n"
+            "После создания отправьте промпт для генерации кода.",
+            parse_mode='Markdown'
+        )
+        return
+    
+    filename = " ".join(ctx.args).strip()
+    
+    # Валидация имени файла
+    if not filename or len(filename) > 100:
+        await update.message.reply_text("❌ Некорректное имя файла")
+        return
+    
+    # Проверяем расширение и определяем язык
+    language = detect_language_from_filename(filename)
+    
+    # Сохраняем активный файл в данных чата
+    ctx.chat_data["active_file"] = filename
+    
     await update.message.reply_text(
-        "Отправьте ТЕКСТ или .TXT — верну ПОЛНЫЙ файл с кодом.\n"
-        "• Первая строка может задать имя файла:  filename: my_app.py\n"
-        "• Вторая строка — язык:  language: python\n"
-        "• Для правок просто пришлите новый промпт — я подложу последнюю версию кода.\n"
-        "• Можно вложить базовый код в конце промпта в блоке ``` — правки будут к нему.\n\n"
-        "/model  — выбрать модель (по умолчанию gpt-5)"
+        f"✅ **Файл создан:** `{filename}`\n"
+        f"🔤 **Язык:** {language}\n\n"
+        "Теперь отправьте промпт для генерации кода!",
+        parse_mode='Markdown'
     )
 
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Управление моделью ИИ для чата"""
     if not ctx.args:
+        current_model = ctx.chat_data.get('model', DEFAULT_MODEL)
+        models_list = "\n".join([f"• `{model}`" for model in AVAILABLE_MODELS])
         await update.message.reply_text(
-            f"Текущая модель: {ctx.chat_data.get('model', DEFAULT_MODEL)}\n"
-            "Использование: /model gpt-5"
+            f"🤖 **Текущая модель:** `{current_model}`\n\n"
+            f"**Доступные модели:**\n{models_list}\n\n"
+            "**Использование:** `/model <название_модели>`",
+            parse_mode='Markdown'
         )
         return
-    ctx.chat_data["model"] = " ".join(ctx.args).strip()
-    await update.message.reply_text(f"Ок. Модель для этого чата: {ctx.chat_data['model']}")
+    
+    new_model = " ".join(ctx.args).strip()
+    if new_model not in AVAILABLE_MODELS:
+        available = "`, `".join(AVAILABLE_MODELS)
+        await update.message.reply_text(
+            f"❌ Модель `{new_model}` недоступна.\n\n"
+            f"**Доступные:** `{available}`",
+            parse_mode='Markdown'
+        )
+        return
+    
+    ctx.chat_data["model"] = new_model
+    await update.message.reply_text(f"✅ **Модель изменена на:** `{new_model}`", parse_mode='Markdown')
+
+async def cmd_files(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показать список созданных файлов"""
+    chat_id = update.effective_chat.id
+    chat_folder = chat_dir(chat_id)
+    
+    if not chat_folder.exists():
+        await update.message.reply_text("📁 Файлов пока нет")
+        return
+    
+    files = list(chat_folder.glob("latest-*"))
+    if not files:
+        await update.message.reply_text("📁 Файлов пока нет")
+        return
+    
+    file_list = []
+    for f in sorted(files):
+        filename = f.name[7:]  # убираем "latest-"
+        size = f.stat().st_size
+        modified = time.strftime("%d.%m %H:%M", time.localtime(f.stat().st_mtime))
+        file_list.append(f"📄 `{filename}` ({size}б, {modified})")
+    
+    active_file = ctx.chat_data.get("active_file", "нет")
+    files_text = "\n".join(file_list)
+    
+    await update.message.reply_text(
+        f"📁 **Ваши файлы:**\n\n{files_text}\n\n"
+        f"🎯 **Активный файл:** `{active_file}`",
+        parse_mode='Markdown'
+    )
+
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сброс настроек чата"""
+    ctx.chat_data.clear()
+    await update.message.reply_text(f"🔄 **Настройки сброшены**\n\n**Модель:** `{DEFAULT_MODEL}`", parse_mode='Markdown')
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений с промптами"""
     chat_id = update.effective_chat.id
     prompt = (update.message.text or "").strip()
     if not prompt:
-        await update.message.reply_text("Промпт пуст. Пришлите текст или .txt.")
+        await update.message.reply_text("❌ Промпт пуст. Пришлите текст или .txt.")
         return
 
     model = ctx.chat_data.get("model", DEFAULT_MODEL)
+    active_file = ctx.chat_data.get("active_file")
+    
     await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
-        vpath, udiff = await process_any_prompt(chat_id, prompt, model)
+        # Используем активный файл если он задан
+        vpath, udiff = await process_any_prompt(chat_id, prompt, model, active_file)
+        
+        # Обновляем активный файл
+        if not active_file:
+            ctx.chat_data["active_file"] = vpath.name.split("-", 1)[-1]
+        
     except Exception as e:
-        await update.message.reply_text(f"Ошибка генерации: {e}")
+        await update.message.reply_text(f"❌ **Ошибка генерации:** {e}", parse_mode='Markdown')
         return
 
-    # Файл
+    # Отправляем файл
+    file_display_name = vpath.name.split("-", 1)[-1]
     with vpath.open("rb") as f:
         await update.message.reply_document(
-            document=InputFile(f, filename=vpath.name.split("-", 1)[-1]),
-            caption="✅ Готово",
+            document=InputFile(f, filename=file_display_name),
+            caption=f"✅ **Готово:** `{file_display_name}`",
+            parse_mode='Markdown'
         )
 
-    # Diff, если был базовый код
+    # Отправляем diff если был базовый код
     if udiff:
         if len(udiff) <= 3500:
-            await update.message.reply_text(f"Изменения:\n```\n{udiff[:3900]}\n```")
+            await update.message.reply_text(f"🔄 **Изменения:**\n```diff\n{udiff[:3900]}\n```", parse_mode='Markdown')
         else:
-            dpath = vpath.with_suffix(".diff.txt")
-            dpath.write_text(udiff, encoding="utf-8")
-            with dpath.open("rb") as f:
+            # Создаем комбинированный файл: промпт + последний код
+            combo_content = f"# Промпт для правки:\n{prompt}\n\n# Последний сгенерированный код:\n\n```\n{vpath.read_text(encoding='utf-8')}\n```"
+            combo_path = vpath.with_suffix(".combo.md")
+            combo_path.write_text(combo_content, encoding="utf-8")
+            
+            with combo_path.open("rb") as f:
                 await update.message.reply_document(
-                    document=InputFile(f, filename=dpath.name),
-                    caption="Изменения (diff)",
+                    document=InputFile(f, filename=f"{file_display_name}.combo.md"),
+                    caption="📝 **Промпт + код для дальнейшего редактирования**",
+                    parse_mode='Markdown'
                 )
 
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обработка загруженных .txt файлов с промптами"""
     chat_id = update.effective_chat.id
     doc = update.message.document
     if not doc:
@@ -375,7 +469,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Принимаем ТОЛЬКО .txt
     if not (doc.file_name or "").lower().endswith(".txt"):
-        await update.message.reply_text("Пришлите .txt-документ с промптом.")
+        await update.message.reply_text("📄 Пришлите .txt-документ с промптом.")
         return
 
     fobj = await ctx.bot.get_file(doc.file_id)
@@ -386,35 +480,51 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prompt = bytes(blob).decode("utf-8", errors="ignore")
 
     if not prompt.strip():
-        await update.message.reply_text("Файл пуст.")
+        await update.message.reply_text("❌ Файл пуст.")
         return
 
     model = ctx.chat_data.get("model", DEFAULT_MODEL)
+    active_file = ctx.chat_data.get("active_file")
+    
     await ctx.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
-        vpath, udiff = await process_any_prompt(chat_id, prompt, model)
+        # Используем активный файл если он задан
+        vpath, udiff = await process_any_prompt(chat_id, prompt, model, active_file)
+        
+        # Обновляем активный файл
+        if not active_file:
+            ctx.chat_data["active_file"] = vpath.name.split("-", 1)[-1]
+            
     except Exception as e:
-        await update.message.reply_text(f"Ошибка генерации: {e}")
+        await update.message.reply_text(f"❌ **Ошибка генерации:** {e}", parse_mode='Markdown')
         return
 
+    # Отправляем файл
+    file_display_name = vpath.name.split("-", 1)[-1]
     with vpath.open("rb") as f:
         await update.message.reply_document(
-            document=InputFile(f, filename=vpath.name.split("-", 1)[-1]),
-            caption="✅ Готово",
+            document=InputFile(f, filename=file_display_name),
+            caption=f"✅ **Готово:** `{file_display_name}`",
+            parse_mode='Markdown'
         )
 
+    # Отправляем diff и комбо-файл если был базовый код
     if udiff:
         if len(udiff) <= 3500:
-            await update.message.reply_text(f"Изменения:\n```\n{udiff[:3900]}\n```")
-        else:
-            dpath = vpath.with_suffix(".diff.txt")
-            dpath.write_text(udiff, encoding="utf-8")
-            with dpath.open("rb") as f:
-                await update.message.reply_document(
-                    document=InputFile(f, filename=dpath.name),
-                    caption="Изменения (diff)",
-                )
+            await update.message.reply_text(f"🔄 **Изменения:**\n```diff\n{udiff[:3900]}\n```", parse_mode='Markdown')
+        
+        # Всегда создаем комбо-файл для удобства дальнейшего редактирования
+        combo_content = f"# Промпт для правки:\n{prompt}\n\n# Последний сгенерированный код:\n\n```\n{vpath.read_text(encoding='utf-8')}\n```"
+        combo_path = vpath.with_suffix(".combo.md")
+        combo_path.write_text(combo_content, encoding="utf-8")
+        
+        with combo_path.open("rb") as f:
+            await update.message.reply_document(
+                document=InputFile(f, filename=f"{file_display_name}.combo.md"),
+                caption="📝 **Промпт + код для дальнейшего редактирования**",
+                parse_mode='Markdown'
+            )
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║                               6) MAIN                                    ║
@@ -422,11 +532,19 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("create", cmd_create))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("files", cmd_files))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    
+    # Обработчики сообщений
     app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,     handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
