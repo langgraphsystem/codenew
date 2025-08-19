@@ -328,8 +328,8 @@ await update.message.reply_text(
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 if not ctx.args:
 await update.message.reply_text(
-f”Текущая модель: {ctx.chat_data.get(‘model’, DEFAULT_MODEL)}\n”
-“Использование: /model gpt-5”
+f"Текущая модель: {ctx.chat_data.get('model', DEFAULT_MODEL)}\n"
+"Использование: /model gpt-5"
 )
 return
 ctx.chat_data[“model”] = “ “.join(ctx.args).strip()
