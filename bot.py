@@ -54,7 +54,7 @@ if not OPENAI_API_KEY:
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Доступные модели для валидации
-AVAILABLE_MODELS = ["gpt-4", "gpt-4-turbo", "gpt-5", "claude-3-sonnet", "claude-3-opus"]
+AVAILABLE_MODELS = ["gpt-5", "claude-4-sonnet", "claude-4-opus"]
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║                   2) НАСТРОЙКИ OPENAI (Responses API)                   ║
